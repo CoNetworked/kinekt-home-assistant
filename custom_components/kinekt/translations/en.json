@@ -1,0 +1,27 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Kinekt",
+        "description": "In the Kinekt app, open Family → Home Assistant, choose what your family will see, and pair. Paste the pairing code it shows here. Home Assistant reaches out to Kinekt; nothing connects into your home.",
+        "data": {"credential": "Pairing code", "api_url": "Kinekt server"},
+        "data_description": {"credential": "Shown once in Kinekt after pairing. If it's lost, disconnect in Kinekt and pair again.", "api_url": "Leave as it is unless Kinekt told you otherwise."}
+      },
+      "reauth_confirm": {
+        "title": "Pair Kinekt again",
+        "description": "This connection was disconnected in Kinekt. Any scheduled lights have been put back. Pair again in Kinekt (Family → Home Assistant) and paste the new code.",
+        "data": {"credential": "Pairing code"}
+      }
+    },
+    "error": {
+      "bad_code": "A pairing code is 64 letters and numbers. Copy the whole code from Kinekt.",
+      "bad_server": "Use the server's https:// address only, with nothing after it.",
+      "invalid_code": "Kinekt didn't accept this code. It may have been disconnected: pair again in Kinekt and paste the new code.",
+      "cannot_connect": "Couldn't reach Kinekt. Check this Home Assistant's internet connection and try again."
+    },
+    "abort": {
+      "already_configured": "This pairing is already set up.",
+      "reauth_successful": "Kinekt is connected again."
+    }
+  }
+}

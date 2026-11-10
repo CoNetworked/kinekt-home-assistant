@@ -1,0 +1,13 @@
+{
+  "domain": "kinekt",
+  "name": "Kinekt",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/CoNetworked/kinekt-home-assistant",
+  "integration_type": "service",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/CoNetworked/kinekt-home-assistant/issues",
+  "requirements": [],
+  "version": "1.2.1"
+}
