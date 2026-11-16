@@ -110,7 +110,8 @@ class KinektBridge:
     def observe(self, selected):
         states, missing = [], False
         for entity in selected:
-            current = self.hass.states.get(entity)
+            # Not a kind of reading Home Assistant shares: missing, never read.
+            current = self.hass.states.get(entity) if logic.shareable(entity) else None
             if current is None:
                 missing = True
                 continue
@@ -124,7 +125,7 @@ class KinektBridge:
         self.selected = selected
         self.stop_watching()
         if not self.legacy:
-            self.unwatch = async_track_state_change_event(self.hass, list(selected), self.changed)
+            self.unwatch = async_track_state_change_event(self.hass, [e for e in selected if logic.shareable(e)], self.changed)
 
     def stop_watching(self):
         if self.unwatch:

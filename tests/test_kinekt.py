@@ -115,6 +115,23 @@ async def test_reports_only_selected_states_and_units(hass: HomeAssistant, aiocl
     assert report['status'] == 'entity_missing' and [s['entityId'] for s in report['states']] == ['sun.sun']
 
 
+async def test_kinekt_asking_for_a_person_or_location_gets_nothing(hass: HomeAssistant, aioclient_mock):
+    """Only the kinds of reading the device list offers are read or reported, whatever Kinekt's selection says."""
+    hass.states.async_set('sun.sun', 'above_horizon', {'friendly_name': 'Sun'})
+    hass.states.async_set('person.alex', 'home', {'latitude': 39.7})
+    hass.states.async_set('device_tracker.phone', 'home', {'latitude': 39.7})
+    kinekt(aioclient_mock, config={'entityIds': ['sun.sun', 'person.alex', 'device_tracker.phone']})
+    await setup(hass, aioclient_mock)
+    [report] = sent(aioclient_mock, '/v1/home-bridge/report')
+    assert report['status'] == 'entity_missing'
+    assert report['states'] == [{'entityId': 'sun.sun', 'state': 'above_horizon', 'unit': None}]
+    # And a change to them is never heard.
+    kinekt(aioclient_mock, config={'entityIds': ['sun.sun', 'person.alex', 'device_tracker.phone']})
+    hass.states.async_set('person.alex', 'not_home', {'latitude': 40.1})
+    await hass.async_block_till_done()
+    assert 'person' not in json.dumps(sent(aioclient_mock, '/v1/home-bridge/report')) and '40.1' not in json.dumps(sent(aioclient_mock, '/v1/home-bridge/report'))
+
+
 async def test_device_list_has_names_and_ids_only(hass: HomeAssistant, aioclient_mock):
     hass.states.async_set('sun.sun', 'above_horizon')
     hass.states.async_set('sensor.kitchen', '21')

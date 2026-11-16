@@ -26,6 +26,12 @@ def valid_entity(entity):
     return isinstance(entity, str) and len(entity) <= 160 and bool(ENTITY.fullmatch(entity))
 
 
+def shareable(entity):
+    """Only the kinds of reading the device list offers ever leave Home Assistant, whatever Kinekt asks for
+    (no people, locations or anything else)."""
+    return valid_entity(entity) and entity.split('.')[0] in CATALOG_DOMAINS
+
+
 def validate_selection(selection):
     """The selected entity IDs from /v1/home-bridge/config."""
     if not isinstance(selection, dict):

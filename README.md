@@ -10,8 +10,10 @@ router ports, no public address and no Home Assistant password to hand over.
 ## What leaves your home
 
 Only the readings a household owner picks in Kinekt, up to 30, and for each one just its state and
-unit (for example `21 °C`). Never locations, history, people, cameras or other attributes. If an
-owner asks Kinekt to **Find home devices**, it sends the names and IDs of your sensors, lights,
+unit (for example `21 °C`). Never locations, history, people, cameras or other attributes. The
+integration enforces this itself: it reads and watches only sensors, binary sensors, lights, fans,
+switches, weather and sun, whatever Kinekt asks for (since 1.2.4). If an owner asks Kinekt for its
+list of home devices, it sends the names and IDs of your sensors, lights,
 fans, switches, weather and sun, but none of their states. Everyone in the Kinekt household can
 see the shared readings; only owners see the device list.
 
