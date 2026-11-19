@@ -19,10 +19,19 @@ see the shared readings; only owners see the device list.
 
 ## What Kinekt can switch
 
-Lights and switches only, on or off, on a schedule an owner sets in Kinekt. Before switching
-anything, the integration saves each device's original state. At the end of the window it puts
-them back, even if Kinekt can't be reached. A restart of Home Assistant keeps the schedule.
-Locks, sirens, cameras, fans and every other kind of device are refused, whatever Kinekt asks.
+Lights and switches only, on or off. Locks, sirens, cameras, fans and every other kind of device are
+refused, whatever Kinekt asks.
+
+- **For a season or a visit**, set by an owner. Before switching anything, the integration saves each
+  device's original state. At the end of the window it puts them back, even if Kinekt can't be reached.
+- **Now** (since 1.3): a grown-up taps a shared light on or off in Kinekt. It runs once, within
+  seconds; a request that waited more than two minutes (Home Assistant was away) never runs.
+- **Every day, or some days, at a time or at sunset/sunrise** (since 1.3). The integration keeps
+  these schedules itself and runs them with or without a connection, up to ten minutes late after a
+  restart, never later. Sunset and sunrise are Home Assistant's own, for your home's location. A
+  light a season or visit is holding is left alone until it ends.
+
+A restart of Home Assistant keeps all of it.
 
 ## Install
 

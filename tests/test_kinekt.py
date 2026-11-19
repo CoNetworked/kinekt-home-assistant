@@ -14,7 +14,9 @@ import asyncio
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed, async_mock_service
 
+from custom_components.kinekt import logic
 from custom_components.kinekt.const import CONF_API_URL, CONF_CREDENTIAL, DOMAIN
+import zoneinfo
 
 API = 'https://kinekt.test'
 CODE = 'a' * 64
@@ -42,7 +44,7 @@ def kinekt(mock, config=None, effects=None, status=200, exc=None, wait=None):
         mock.get(f'{API}/v1/home-bridge/wait', status=status, json=wait)
     else:
         mock.get(f'{API}/v1/home-bridge/wait', status=404 if status == 200 else status, json={})
-    for path in ('report', 'catalog', 'effects/report'):
+    for path in ('report', 'catalog', 'effects/report', 'lights/report'):
         mock.post(f'{API}/v1/home-bridge/{path}', status=status, json={'ok': True})
 
 
@@ -321,3 +323,107 @@ async def test_an_older_kinekt_gets_the_30_second_check_ins(hass: HomeAssistant,
     await bridge.tick()
     [report] = sent(aioclient_mock, '/v1/home-bridge/report')
     assert 'heartbeatSeconds' not in report
+
+
+COMMAND = '7d2b8f3c-0000-4000-8000-0000000000c1'
+ROUTINE = '7d2b8f3c-0000-4000-8000-0000000000d1'
+
+
+def lights(commands=(), routines=(), timezone='America/Denver'):
+    return {'timezone': timezone, 'commands': list(commands), 'routines': list(routines)}
+
+
+async def test_a_light_turned_off_now_from_kinekt(hass: HomeAssistant, aioclient_mock):
+    """TK, Nov 18: "I forgot to turn the basement off. Turn that light off now." Once, and Kinekt hears how it went."""
+    hass.states.async_set('sun.sun', 'above_horizon')
+    hass.states.async_set('light.porch', 'on', {'friendly_name': 'Porch light'})
+    calls = light_service(hass, 'light.porch')
+    off = {'id': COMMAND, 'entityId': 'light.porch', 'command': 'turn_off', 'expiresAt': iso(datetime.timedelta(minutes=2))}
+    answer = {'etag': 'e1', 'config': {'entityIds': ['sun.sun', 'light.porch']}, 'effects': [], 'lights': lights([off]), 'checkInSeconds': 600}
+    kinekt(aioclient_mock, config={'entityIds': ['sun.sun', 'light.porch']}, wait=answer)
+    entry = await setup(hass, aioclient_mock)
+    bridge = entry.runtime_data
+    assert await until(lambda: calls == ['turn_off'])
+    assert hass.states.get('light.porch').state == 'off'
+    assert await until(lambda: sent(aioclient_mock, '/v1/home-bridge/lights/report'))
+    assert sent(aioclient_mock, '/v1/home-bridge/lights/report')[0] == {'commandId': COMMAND, 'status': 'done'}
+    assert sent(aioclient_mock, '/v1/home-bridge/report')[0]['features'] == ['lights']
+    # The same request again (Kinekt hasn't heard yet): it doesn't run twice.
+    await bridge.take_lights(logic.validate_lights(lights([off])))
+    assert calls == ['turn_off']
+    # An old request (the add-on was away): never.
+    stale = dict(off, id='7d2b8f3c-0000-4000-8000-0000000000c2', command='turn_on', expiresAt=iso(datetime.timedelta(seconds=-1)))
+    await bridge.take_lights(logic.validate_lights(lights([stale])))
+    assert calls == ['turn_off']
+
+
+async def test_a_schedule_runs_once_at_its_time_and_a_trip_wins(hass: HomeAssistant, aioclient_mock):
+    """Kitchen off at 8:30 PM every day: once that evening, not again; a light a trip is holding is left alone."""
+    hass.states.async_set('sun.sun', 'above_horizon')
+    hass.states.async_set('light.porch', 'on', {'friendly_name': 'Porch light'})
+    calls = light_service(hass, 'light.porch')
+    kinekt(aioclient_mock, config={'entityIds': ['sun.sun']}, wait={'etag': 'e1', 'config': {'entityIds': ['sun.sun']}, 'effects': [], 'checkInSeconds': 600})
+    entry = await setup(hass, aioclient_mock)
+    bridge = entry.runtime_data
+    assert await until(lambda: bridge.etag == 'e1')
+    bridge.revoked = True  # quiet the waiting loop; schedules run from the ledger regardless
+    routine = {'id': ROUTINE, 'entityIds': ['light.porch'], 'command': 'turn_off', 'at': {'kind': 'time', 'time': '20:30'}, 'days': [1, 2, 3, 4, 5, 6, 7]}
+    await bridge.take_lights(logic.validate_lights(lights(routines=[routine])))
+    zone = zoneinfo.ZoneInfo('America/Denver')
+    before = datetime.datetime(2026, 11, 18, 20, 29, tzinfo=zone)
+    await bridge.run_routines(before)
+    assert calls == []
+    await bridge.run_routines(before + datetime.timedelta(minutes=2))
+    assert calls == ['turn_off']
+    await bridge.run_routines(before + datetime.timedelta(minutes=5))
+    assert calls == ['turn_off'], 'once a day'
+    # Saved: after a restart, it remembers it ran and still has the schedule with no connection.
+    assert bridge.ledger['lights']['routines'][0]['id'] == ROUTINE
+    # The next evening a trip holds the porch light: the schedule leaves it be.
+    bridge.ledger['applied'] = {BINDING: {'expiresAt': iso(datetime.timedelta(days=3)), 'prior': [{'entityId': 'light.porch', 'state': 'on'}], 'restored': False}}
+    hass.states.async_set('light.porch', 'on')
+    await bridge.run_routines(before + datetime.timedelta(days=1, minutes=2))
+    assert calls == ['turn_off']
+    # Ten minutes late is the most: Home Assistant back at 9 PM doesn't turn it off then.
+    bridge.ledger['applied'] = {}
+    await bridge.run_routines(before + datetime.timedelta(days=2, minutes=31))
+    assert calls == ['turn_off']
+
+
+async def test_a_schedule_at_sunset_uses_home_assistants_sunset(hass: HomeAssistant, aioclient_mock):
+    hass.states.async_set('sun.sun', 'above_horizon')
+    hass.states.async_set('light.porch', 'off', {'friendly_name': 'Porch light'})
+    calls = light_service(hass, 'light.porch')
+    kinekt(aioclient_mock, config={'entityIds': ['sun.sun']}, wait={'etag': 'e1', 'config': {'entityIds': ['sun.sun']}, 'effects': [], 'checkInSeconds': 600})
+    entry = await setup(hass, aioclient_mock)
+    bridge = entry.runtime_data
+    assert await until(lambda: bridge.etag == 'e1')
+    bridge.revoked = True
+    sunset = datetime.datetime(2026, 11, 18, 23, 40, tzinfo=datetime.timezone.utc)
+    bridge.sun = lambda kind, day: sunset if kind == 'sunset' else None
+    routine = {'id': ROUTINE, 'entityIds': ['light.porch'], 'command': 'turn_on', 'at': {'kind': 'sunset', 'offsetMinutes': 30}, 'days': [3]}
+    await bridge.take_lights(logic.validate_lights(lights(routines=[routine])))
+    await bridge.run_routines(sunset + datetime.timedelta(minutes=29))
+    assert calls == []
+    await bridge.run_routines(sunset + datetime.timedelta(minutes=31))
+    assert calls == ['turn_on']
+
+
+def test_kinekt_light_settings_are_checked():
+    """Only lights and switches, real IDs and times; anything else is refused whole."""
+    good = lights([{'id': COMMAND, 'entityId': 'light.porch', 'command': 'turn_on', 'expiresAt': iso(datetime.timedelta(minutes=2))}],
+                  [{'id': ROUTINE, 'entityIds': ['switch.coffee'], 'command': 'turn_off', 'at': {'kind': 'sunrise', 'offsetMinutes': -30}, 'days': [1]}])
+    assert logic.validate_lights(good)['routines'][0]['at'] == {'kind': 'sunrise', 'offsetMinutes': -30}
+    assert logic.validate_lights(None) == {'timezone': None, 'commands': [], 'routines': []}
+    for bad in (
+        lights([{'id': COMMAND, 'entityId': 'lock.front_door', 'command': 'turn_off', 'expiresAt': iso(datetime.timedelta(minutes=2))}]),
+        lights(routines=[{'id': ROUTINE, 'entityIds': ['light.porch'], 'command': 'toggle', 'at': {'kind': 'time', 'time': '20:30'}, 'days': [1]}]),
+        lights(routines=[{'id': ROUTINE, 'entityIds': ['light.porch'], 'command': 'turn_on', 'at': {'kind': 'time', 'time': '25:00'}, 'days': [1]}]),
+        lights(routines=[{'id': ROUTINE, 'entityIds': ['light.porch'], 'command': 'turn_on', 'at': {'kind': 'time', 'time': '20:00'}, 'days': [8]}]),
+        lights(timezone='Mars/Olympus'),
+    ):
+        try:
+            logic.validate_lights(bad)
+        except logic.BridgeError:
+            continue
+        raise AssertionError(f'accepted {bad}')

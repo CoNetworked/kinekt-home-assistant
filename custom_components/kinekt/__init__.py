@@ -1,4 +1,5 @@
-"""Kinekt: share chosen Home Assistant readings with your family and run scheduled light effects.
+"""Kinekt: share chosen Home Assistant readings with your family, run scheduled light effects, and (1.3) lights
+turned on or off from Kinekt now or on a schedule.
 
 Changes go out when Home Assistant sees them, with a check-in every 10 minutes, and Kinekt's news arrives on one
 outbound request that waits. Nothing connects into the home.
@@ -20,7 +21,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     bridge.on_revoked = lambda: entry.async_start_reauth(hass)
     entry.runtime_data = bridge
     entry.async_on_unload(async_track_time_interval(hass, bridge.heartbeat, timedelta(seconds=HEARTBEAT_SECONDS), name='Kinekt home bridge check-in'))
-    entry.async_on_unload(async_track_time_interval(hass, bridge.local_tick, timedelta(seconds=LOCAL_SECONDS), name='Kinekt home effects deadlines'))
+    entry.async_on_unload(async_track_time_interval(hass, bridge.local_tick, timedelta(seconds=LOCAL_SECONDS), name='Kinekt home effects deadlines and light schedules'))
     entry.async_on_unload(bridge.stop_watching)
     entry.async_create_background_task(hass, bridge.run(), 'Kinekt home bridge')
     return True

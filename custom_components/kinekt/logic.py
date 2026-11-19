@@ -7,6 +7,7 @@ against both copies so they cannot drift.
 import datetime
 import re
 import uuid
+import zoneinfo
 
 ENTITY = re.compile(r'[a-z][a-z0-9_]*\.[a-z0-9_]+')
 COMMANDS = {'turn_on', 'turn_off'}
@@ -161,3 +162,112 @@ def plan_effect_steps(ledger, desired, now):
 
 def pending(ledger):
     return any(not item.get('restored') for item in (ledger.get('applied') or {}).values())
+
+
+# Lights from Kinekt (1.3; TK, Nov 18: "simple controls, schedules… Turn that light off now"). Grown-ups in Kinekt
+# turn a shared light or switch on or off now, or on set days at a time or at sunset/sunrise. Schedules are kept here
+# so they run with no connection; a light a trip or season is holding is left alone (TK: the trip wins).
+MAX_COMMANDS = 20
+MAX_ROUTINES = 30
+# A schedule runs up to ten minutes late (Home Assistant restarting at 8:31 still turns the kitchen off), never later.
+GRACE_MINUTES = 10
+CLOCK = re.compile(r'([01]\d|2[0-3]):[0-5]\d')
+UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+
+def _when(value):
+    moment = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if moment.tzinfo is None:
+        raise ValueError('naive')
+    return moment
+
+
+def validate_lights(payload):
+    """What Kinekt says to do with lights. None (a Kinekt before lights): nothing to do."""
+    if payload is None:
+        return {'timezone': None, 'commands': [], 'routines': []}
+    error = BridgeError('Kinekt returned invalid light settings.')
+    if not isinstance(payload, dict):
+        raise error
+    zone = payload.get('timezone')
+    try:
+        if not isinstance(zone, str) or len(zone) > 64:
+            raise ValueError(zone)
+        zoneinfo.ZoneInfo(zone)
+    except (ValueError, zoneinfo.ZoneInfoNotFoundError) as problem:
+        raise error from problem
+    commands, routines = payload.get('commands'), payload.get('routines')
+    if not isinstance(commands, list) or len(commands) > MAX_COMMANDS or not isinstance(routines, list) or len(routines) > MAX_ROUTINES:
+        raise error
+    clean_commands = []
+    for item in commands:
+        if not isinstance(item, dict) or not isinstance(item.get('id'), str) or not UUID.fullmatch(item['id']) or not valid_action(item) or not isinstance(item.get('expiresAt'), str):
+            raise error
+        try:
+            expires = _when(item['expiresAt'])
+        except ValueError as problem:
+            raise error from problem
+        clean_commands.append({'id': item['id'], 'entityId': item['entityId'], 'command': item['command'], 'expiresAt': now_iso(expires.astimezone(datetime.timezone.utc))})
+    clean_routines = []
+    for item in routines:
+        if not isinstance(item, dict) or not isinstance(item.get('id'), str) or not UUID.fullmatch(item['id']) or item.get('command') not in COMMANDS:
+            raise error
+        entities, days, at = item.get('entityIds'), item.get('days'), item.get('at')
+        if not isinstance(entities, list) or not 1 <= len(entities) <= 8 or len(set(entities)) != len(entities) or any(not valid_action({'entityId': e, 'command': item['command']}) for e in entities):
+            raise error
+        if not isinstance(days, list) or not 1 <= len(days) <= 7 or len(set(days)) != len(days) or any(type(d) is not int or not 1 <= d <= 7 for d in days):
+            raise error
+        if not isinstance(at, dict):
+            raise error
+        if at.get('kind') == 'time' and isinstance(at.get('time'), str) and CLOCK.fullmatch(at['time']):
+            clean_at = {'kind': 'time', 'time': at['time']}
+        elif at.get('kind') in ('sunset', 'sunrise') and type(at.get('offsetMinutes')) is int and -180 <= at['offsetMinutes'] <= 180:
+            clean_at = {'kind': at['kind'], 'offsetMinutes': at['offsetMinutes']}
+        else:
+            raise error
+        clean_routines.append({'id': item['id'], 'entityIds': list(entities), 'command': item['command'], 'at': clean_at, 'days': sorted(days)})
+    return {'timezone': zone, 'commands': clean_commands, 'routines': clean_routines}
+
+
+def due_commands(commands, done, now):
+    """On/off-now requests not done yet and not expired (an old tap never flips a light much later)."""
+    return [c for c in commands if c['id'] not in done and _when(c['expiresAt']) > now]
+
+
+def routine_time(routine, day, zone, sun):
+    """When a schedule runs on `day` (a date in the family's time zone): its clock time there, or that day's sunset or
+    sunrise (`sun(kind, day)` gives an aware datetime, or None when Home Assistant doesn't know) with its offset."""
+    at = routine['at']
+    if at['kind'] == 'time':
+        hour, minute = (int(part) for part in at['time'].split(':'))
+        return datetime.datetime(day.year, day.month, day.day, hour, minute, tzinfo=zoneinfo.ZoneInfo(zone))
+    moment = sun(at['kind'], day)
+    return None if moment is None else moment + datetime.timedelta(minutes=at['offsetMinutes'])
+
+
+def due_routines(routines, ran, now, zone, sun, held):
+    """Schedules to run now: today is one of their days, their time came within GRACE_MINUTES, and they haven't run
+    today. `ran`: routine ID → the last day it ran. Devices in `held` (a trip or season holding them) are left alone.
+    Returns [{'routineId', 'day', 'actions'}]; a schedule whose devices are all held still counts as run."""
+    if not zone:
+        return []
+    today = now.astimezone(zoneinfo.ZoneInfo(zone)).date()
+    out = []
+    for routine in routines:
+        if today.isoweekday() not in routine['days'] or ran.get(routine['id']) == today.isoformat():
+            continue
+        moment = routine_time(routine, today, zone, sun)
+        if moment is None or not moment <= now < moment + datetime.timedelta(minutes=GRACE_MINUTES):
+            continue
+        out.append({'routineId': routine['id'], 'day': today.isoformat(),
+                    'actions': [{'entityId': e, 'command': routine['command']} for e in routine['entityIds'] if e not in held]})
+    return out
+
+
+def held_devices(ledger):
+    """Devices a running effect (a trip, a season, a camera mute) is holding."""
+    out = set()
+    for item in (ledger.get('applied') or {}).values():
+        if not item.get('restored'):
+            out.update(prior.get('entityId') for prior in item.get('prior') or [] if isinstance(prior, dict))
+    return out

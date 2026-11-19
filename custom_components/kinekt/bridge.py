@@ -21,6 +21,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers.sun import get_astral_event_date
 
 from . import logic
 from .logic import BridgeError
@@ -88,6 +89,8 @@ class KinektBridge:
         self.pending = None
         # True against a server without /wait: every 30 seconds, as 1.1.0 did.
         self.legacy = False
+        # 1.3: lights from Kinekt (on/off now, and schedules kept in the ledger so they run with no connection).
+        self.lights = {'timezone': None, 'commands': [], 'routines': []}
 
     async def async_load(self):
         stored = await self.store.async_load()
@@ -149,6 +152,8 @@ class KinektBridge:
         report = {'operationId': str(uuid.uuid4()), 'observedAt': logic.now_iso(), 'status': status, 'states': states}
         if not self.legacy:
             report['heartbeatSeconds'] = HEARTBEAT_SECONDS
+            # 1.3: Kinekt can show the Lights card's switches and schedules.
+            report['features'] = ['lights']
         await self.send('/v1/home-bridge/report', report)
         return status
 
@@ -255,6 +260,63 @@ class KinektBridge:
             _LOGGER.info('Home effects: %s change(s).', len(steps))
         return not logic.pending(self.ledger) if revoked or drain else False
 
+    def sun(self, kind, day):
+        """That day's sunset or sunrise where this Home Assistant is (its own location), or None."""
+        return get_astral_event_date(self.hass, kind, day)
+
+    async def take_lights(self, lights):
+        """Kinekt's lights: keep the schedules (they run from the ledger, connection or not), then run what's asked now."""
+        self.lights = lights
+        if lights['timezone']:
+            self.ledger['lights'] = {'timezone': lights['timezone'], 'routines': lights['routines']}
+            await self.save()
+        await self.run_commands(lights['commands'])
+        await self.run_routines()
+
+    async def run_commands(self, commands):
+        """On or off now. Each request runs once; how it went goes back to Kinekt (and retries if that fails)."""
+        done = list(self.ledger.get('commandsDone') or [])
+        for command in logic.due_commands(commands, set(done), datetime.datetime.now(datetime.timezone.utc)):
+            try:
+                await self.call_service(command)
+                status = 'done'
+            except (HomeAssistantError, BridgeError):
+                status = 'failed'
+                _LOGGER.warning('Home lights: a light did not change.')
+            done = (done + [command['id']])[-100:]
+            self.ledger['commandsDone'] = done
+            self.ledger.setdefault('lightReports', []).append({'commandId': command['id'], 'status': status})
+            await self.save()
+        for report in list(self.ledger.get('lightReports') or []):
+            try:
+                await self.request('/v1/home-bridge/lights/report', report)
+            except (KinektAuthError, KinektHTTPError, KinektUnreachable, BridgeError):
+                break
+            self.ledger['lightReports'].remove(report)
+            await self.save()
+
+    async def run_routines(self, now=None):
+        """Schedules whose time has come, from the ledger; a light a trip is holding is left alone."""
+        kept = self.ledger.get('lights') or {}
+        routines = kept.get('routines') or []
+        if not routines:
+            return
+        ran = dict(self.ledger.get('routineRuns') or {})
+        due = logic.due_routines(routines, ran, now or datetime.datetime.now(datetime.timezone.utc), kept.get('timezone'), self.sun, logic.held_devices(self.ledger))
+        for item in due:
+            for action in item['actions']:
+                try:
+                    await self.call_service(action)
+                except (HomeAssistantError, BridgeError):
+                    _LOGGER.warning('Home lights: a scheduled light did not change.')
+            ran[item['routineId']] = item['day']
+        if due:
+            # Only schedules Kinekt still has are remembered.
+            ids = {routine['id'] for routine in routines}
+            self.ledger['routineRuns'] = {key: day for key, day in ran.items() if key in ids}
+            await self.save()
+            _LOGGER.info('Home lights: %s schedule(s) ran.', len(due))
+
     async def revoke(self):
         """Disconnected in Kinekt: put every device back and ask the owner to pair again."""
         self.stop_watching()
@@ -303,12 +365,17 @@ class KinektBridge:
                 await self.effects_cycle(local=True)
             except (HomeAssistantError, BridgeError, ValueError, KeyError, TypeError):
                 _LOGGER.warning('Home effects: the schedule or local recovery is unavailable.')
+            try:
+                await self.run_routines()
+            except (HomeAssistantError, BridgeError, ValueError, KeyError, TypeError):
+                _LOGGER.warning('Home lights: a schedule could not run.')
 
     async def apply(self, answer):
         """What /wait said: what to share, a device-list request, and the effects to have on."""
         config = answer.get('config') if isinstance(answer, dict) else None
         selected = logic.validate_selection(config)
         desired = logic.validate_desired({'effects': answer.get('effects')})
+        lights = logic.validate_lights(answer.get('lights'))
         etag = answer.get('etag')
         if not isinstance(etag, str) or len(etag) > 80:
             raise BridgeError('Kinekt returned an invalid answer.')
@@ -322,6 +389,7 @@ class KinektBridge:
                 except KinektHTTPError:
                     _LOGGER.info('Home device list: Kinekt could not accept the result.')
             await self.effects_cycle(desired=desired)
+            await self.take_lights(lights)
             self.etag = etag
 
     async def listen(self):
