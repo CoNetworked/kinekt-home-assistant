@@ -10,6 +10,7 @@ from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 import asyncio
+import pytest
 
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed, async_mock_service
@@ -311,8 +312,16 @@ async def test_a_change_is_reported_when_home_assistant_sees_it(hass: HomeAssist
     assert report['heartbeatSeconds'] == 600
 
 
+@pytest.fixture(autouse=True)
+def quick_not_found(monkeypatch):
+    """1.3.1's waits between "not found" answers, made short for the tests."""
+    from custom_components.kinekt import const
+    monkeypatch.setattr(const, 'NOT_FOUND_RETRY_SECONDS', 0.05)
+
+
 async def test_an_older_kinekt_gets_the_30_second_check_ins(hass: HomeAssistant, aioclient_mock):
-    """A Kinekt without /wait (404): the plugin checks in every 30 seconds, as 1.1.0 did, and doesn't watch states."""
+    """A Kinekt without /wait (404, three times): the plugin checks in every 30 seconds, as 1.1.0 did, and doesn't
+    watch states."""
     hass.states.async_set('sun.sun', 'above_horizon')
     kinekt(aioclient_mock, config={'entityIds': ['sun.sun']})
     entry = await setup(hass, aioclient_mock)
@@ -427,3 +436,25 @@ def test_kinekt_light_settings_are_checked():
         except logic.BridgeError:
             continue
         raise AssertionError(f'accepted {bad}')
+
+
+async def test_a_kinekt_restarting_is_not_an_older_kinekt(hass: HomeAssistant, aioclient_mock, monkeypatch):
+    """1.3.1 (TK, Nov 19: after a Kinekt deploy the Lights card said "update to 1.3"): one "not found" while Kinekt
+    restarts doesn't switch to the 30-second check-ins; and from those, the waiting request is tried again, so lights
+    come back by themselves."""
+    from custom_components.kinekt import bridge as bridge_module, const
+    monkeypatch.setattr(const, 'RETRY_WAIT_SECONDS', 0.2)
+    monkeypatch.setattr(bridge_module, 'INTERVAL_SECONDS', 0.05)
+    hass.states.async_set('sun.sun', 'above_horizon')
+    # A Kinekt that answers "not found" for now (restarting, or old): after three, the 30-second check-ins.
+    kinekt(aioclient_mock, config={'entityIds': ['sun.sun']})
+    entry = await setup(hass, aioclient_mock)
+    bridge = entry.runtime_data
+    assert await until(lambda: bridge.legacy)
+    # Kinekt is back: within the retry, the waiting request works again and the report says lights.
+    kinekt(aioclient_mock, config={'entityIds': ['sun.sun']}, wait={'etag': 'e1', 'config': {'entityIds': ['sun.sun']}, 'effects': [], 'checkInSeconds': 600})
+    assert await until(lambda: not bridge.legacy and bridge.unwatch is not None, seconds=5)
+    await bridge.check_in(fetch=False)
+    reports = sent(aioclient_mock, '/v1/home-bridge/report')
+    assert reports and reports[-1].get('features') == ['lights']
+

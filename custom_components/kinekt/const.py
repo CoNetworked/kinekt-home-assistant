@@ -13,3 +13,9 @@ LOCAL_SECONDS = 30
 DEBOUNCE_SECONDS = 2
 # A server without the waiting request: every 30 seconds, as 1.1.0 did.
 INTERVAL_SECONDS = 30
+# 1.3.1 (TK, Nov 19: the Lights card said "update to 1.3" again after a Kinekt deploy): a "not found" while Kinekt
+# restarts isn't an older Kinekt. Three in a row, NOT_FOUND_RETRY_SECONDS apart, before the 30-second check-ins; and
+# from those, the waiting request is tried again every RETRY_WAIT_SECONDS.
+NOT_FOUND_RETRY_SECONDS = 20
+NOT_FOUND_TIMES = 3
+RETRY_WAIT_SECONDS = 600

@@ -25,6 +25,7 @@ from homeassistant.helpers.sun import get_astral_event_date
 
 from . import logic
 from .logic import BridgeError
+from . import const
 from .const import DEBOUNCE_SECONDS, HEARTBEAT_SECONDS, INTERVAL_SECONDS, WAIT_SECONDS
 
 _LOGGER = logging.getLogger(__name__)
@@ -89,6 +90,7 @@ class KinektBridge:
         self.pending = None
         # True against a server without /wait: every 30 seconds, as 1.1.0 did.
         self.legacy = False
+        self.recovering = False
         # 1.3: lights from Kinekt (on/off now, and schedules kept in the ledger so they run with no connection).
         self.lights = {'timezone': None, 'commands': [], 'routines': []}
 
@@ -395,6 +397,7 @@ class KinektBridge:
     async def listen(self):
         """Wait on Kinekt for changes, one request at a time. A server without /wait: back to every 30 seconds."""
         pause = 5
+        not_found = 0
         loop = asyncio.get_running_loop()
         while not self.revoked:
             try:
@@ -402,7 +405,15 @@ class KinektBridge:
                 answer = await self.request(f'/v1/home-bridge/wait?wait={WAIT_SECONDS}&max={logic.MAX_EFFECTS}&etag={self.etag}', seconds=WAIT_SECONDS + 15)
                 if answer is not None:
                     await self.apply(answer)
+                    # Back from the 30-second check-ins (1.3.1): watch the shared devices again, and report now, so
+                    # Kinekt shows the lights' switches without waiting for the 10-minute check-in.
+                    if self.recovering:
+                        self.recovering = False
+                        if self.selected:
+                            self.watch(list(self.selected))
+                        await self.check_in(fetch=False)
                 pause = 5
+                not_found = 0
                 # Kinekt answers "nothing new" only after waiting; one that answers at once (a proxy, an older
                 # Kinekt) is asked again after a pause, never in a tight loop.
                 if self.etag == before and loop.time() - started < 5:
@@ -412,6 +423,11 @@ class KinektBridge:
                 return
             except KinektHTTPError as error:
                 if error.status == 404:
+                    # A Kinekt restarting (a deploy) answers "not found" for a moment, like one from before /wait.
+                    not_found += 1
+                    if not_found < const.NOT_FOUND_TIMES:
+                        await asyncio.sleep(const.NOT_FOUND_RETRY_SECONDS)
+                        continue
                     _LOGGER.info('Kinekt home bridge: this Kinekt checks in every 30 seconds.')
                     self.legacy = True
                     self.stop_watching()
@@ -423,12 +439,22 @@ class KinektBridge:
                 pause = min(pause * 2, 300)
 
     async def run(self):
-        """The first check-in, then waiting on Kinekt; against an older Kinekt, the 30-second cycle."""
+        """The first check-in, then waiting on Kinekt; against an older Kinekt, the 30-second cycle, trying the waiting
+        request again every so often (1.3.1), so a Kinekt that was only restarting gets the add-on back."""
         await self.tick()
-        await self.listen()
-        while self.legacy and not self.revoked:
-            await asyncio.sleep(INTERVAL_SECONDS)
-            await self.tick()
+        loop = asyncio.get_running_loop()
+        while not self.revoked:
+            await self.listen()
+            if self.revoked or not self.legacy:
+                return
+            until = loop.time() + const.RETRY_WAIT_SECONDS
+            while self.legacy and not self.revoked and loop.time() < until:
+                await asyncio.sleep(INTERVAL_SECONDS)
+                await self.tick()
+            if self.revoked:
+                return
+            self.legacy = False
+            self.recovering = True
 
     async def tick(self, *_):
         """One full cycle: the first check-in, and every 30 seconds against an older Kinekt. Local restoration always
